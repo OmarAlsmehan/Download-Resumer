@@ -1,0 +1,707 @@
+name: ⬇️ Smart Download & Release
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Triggers
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  workflow_dispatch:
+    inputs:
+
+      # ── Source ───────────────────────────────────────────────────────────────
+      source_type:
+        description: "📡 Source type"
+        required: false
+        type: choice
+        options:
+          - file   # direct URL download via aria2c
+          - git    # git clone → pack → compress
+        default: file
+
+      url:
+        description: "🔗 Download URL (file) or repository URL (git)"
+        required: true
+        type: string
+
+      filename:
+        description: "📁 Output filename — leave blank for auto-detection (file mode only)"
+        required: false
+        type: string
+
+      expected_checksum:
+        description: "🔐 Expected SHA256 — verifies integrity after download (file mode only)"
+        required: false
+        type: string
+
+      # ── Git options ──────────────────────────────────────────────────────────
+      git_clone_depth:
+        description: "🔢 Clone depth (1 = latest commit only / 0 = full history)"
+        required: false
+        type: string
+        default: "1"
+
+      git_strip_dotgit:
+        description: "🗑️ Remove .git directory before packing (recommended for release artifacts)"
+        required: false
+        type: boolean
+        default: true
+
+      # ── Compression ──────────────────────────────────────────────────────────
+      #
+      #  Detection is always content-based via `file --mime-type` (not extension).
+      #  This input controls the OUTPUT FORMAT when compression is needed.
+      #
+      #  Special case — uncompressed tar (application/x-tar):
+      #    The archive is extracted and repacked with the chosen format.
+      #    Recommended format for git repos: zst (best ratio + fastest decomp)
+      #
+      compress_format:
+        description: "🗜️ Output compression format (auto-skipped if already compressed)"
+        required: false
+        type: choice
+        options:
+          - zst      # best ratio + fastest decompression — recommended for git
+          - tar.gz   # good ratio, universal compatibility
+          - zip      # widest compatibility
+          - none     # skip compression entirely
+        default: zst
+
+      compression_level:
+        description: "⚙️ Compression level 1–19 for zst / 1–9 for others (higher = smaller)"
+        required: false
+        type: string
+        default: "9"
+
+      # ── Transfer ─────────────────────────────────────────────────────────────
+      split_size:
+        description: "✂️ Max part size for large files (e.g. 1900M) — blank to disable"
+        required: false
+        type: string
+        default: "1900M"
+
+      connections:
+        description: "⚡ Parallel download connections for file mode (1–16)"
+        required: false
+        type: string
+        default: "8"
+
+      extra_headers:
+        description: "🔑 Custom HTTP header (e.g. Authorization: Bearer TOKEN) — works for both file and git"
+        required: false
+        type: string
+
+      # ── Release ──────────────────────────────────────────────────────────────
+      release_tag:
+        description: "🏷️ Release tag — auto-generated if blank"
+        required: false
+        type: string
+
+      release_name:
+        description: "📝 Release title — auto-generated if blank"
+        required: false
+        type: string
+
+      prerelease:
+        description: "🚧 Publish as pre-release"
+        required: false
+        type: boolean
+        default: false
+
+      draft:
+        description: "📋 Save as draft — do not publish immediately"
+        required: false
+        type: boolean
+        default: false
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Permissions & globals
+# ──────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: write
+
+env:
+  WORK_DIR: /tmp/dl
+  PARTS_DIR: /tmp/parts
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Job
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §1  ENVIRONMENT SETUP
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🔧 Install dependencies
+        run: |
+          echo "::group::Installing packages"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends aria2 zstd file git
+          mkdir -p "$WORK_DIR" "$PARTS_DIR"
+          echo "aria2c : $(aria2c --version | head -1)"
+          echo "zstd   : $(zstd --version)"
+          echo "git    : $(git --version)"
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §2  PRE-FLIGHT — validate URL, resolve metadata
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🛫 Pre-flight — validate URL, resolve metadata
+        id: preflight
+        run: |
+          echo "::group::Pre-flight checks"
+          URL="${{ inputs.url }}"
+          HEADER_ARG="${{ inputs.extra_headers }}"
+          SOURCE_TYPE="${{ inputs.source_type }}"
+
+          # ── Validate URL scheme ─────────────────────────────────────────────
+          if [[ ! "$URL" =~ ^https?:// ]]; then
+            echo "::error::URL must start with http:// or https://"
+            exit 1
+          fi
+
+          if [[ "$SOURCE_TYPE" == "git" ]]; then
+            # ── Git mode: derive name from repo URL ─────────────────────────
+            REPO_NAME=$(basename "$URL" .git)
+            RAW_NAME="$REPO_NAME"
+            SAFE_NAME=$(echo "$REPO_NAME" | tr ' ' '_' | tr -cd '[:alnum:]._-')
+            REMOTE_SIZE="Unknown (git repo)"
+            echo "→ Git repository: $REPO_NAME"
+
+          else
+            # ── File mode: HEAD request + filename resolution ───────────────
+            echo "→ Probing: $URL"
+            CURL_FLAGS=(--silent --head --max-time 30 --retry 3 --retry-delay 5 --location)
+            [[ -n "$HEADER_ARG" ]] && CURL_FLAGS+=(--header "$HEADER_ARG")
+
+            HTTP_RESPONSE=$(curl "${CURL_FLAGS[@]}" "$URL")
+            HTTP_STATUS=$(echo "$HTTP_RESPONSE" | grep -i '^HTTP/' | tail -1 | awk '{print $2}')
+            CONTENT_LENGTH=$(echo "$HTTP_RESPONSE" | grep -i '^content-length:' | tail -1 \
+              | awk '{print $2}' | tr -d '\r')
+            CD_HEADER=$(echo "$HTTP_RESPONSE" | grep -i '^content-disposition:' | tail -1)
+
+            case "$HTTP_STATUS" in
+              200|206) echo "→ Server responded: HTTP $HTTP_STATUS" ;;
+              301|302) echo "::notice::Redirect detected (HTTP $HTTP_STATUS)" ;;
+              4*|5*)   echo "::warning::Server returned HTTP $HTTP_STATUS — proceeding with caution" ;;
+              *)       echo "→ HTTP $HTTP_STATUS" ;;
+            esac
+
+            # Resolve filename
+            if [[ -n "${{ inputs.filename }}" ]]; then
+              RAW_NAME="${{ inputs.filename }}"
+            else
+              RAW_NAME=$(echo "$CD_HEADER" \
+                | sed -n "s/.*filename[^=]*=[[:space:]]*[\"']\?\([^\"';\r\n]*\).*/\1/Ip" \
+                | tr -d '[:space:]')
+              [[ -z "$RAW_NAME" ]] && RAW_NAME=$(basename "$(echo "$URL" | cut -d'?' -f1)")
+              [[ -z "$RAW_NAME" ]] && RAW_NAME="download_${{ github.run_number }}"
+            fi
+
+            SAFE_NAME=$(echo "$RAW_NAME" | tr ' ' '_' | tr -cd '[:alnum:]._-')
+            [[ -z "$SAFE_NAME" ]] && SAFE_NAME="file_${{ github.run_number }}"
+
+            if [[ -n "$CONTENT_LENGTH" && "$CONTENT_LENGTH" =~ ^[0-9]+$ ]]; then
+              REMOTE_SIZE=$(numfmt --to=iec "$CONTENT_LENGTH")
+            else
+              REMOTE_SIZE="Unknown"
+            fi
+          fi
+
+          # ── Auto-generate release tag and title ─────────────────────────────
+          TIMESTAMP=$(date +'%Y%m%d-%H%M')
+          TAG="${{ inputs.release_tag }}"
+          [[ -z "$TAG" ]] && TAG="release-${TIMESTAMP}-${{ github.run_number }}"
+          RNAME="${{ inputs.release_name }}"
+          [[ -z "$RNAME" ]] && RNAME="📦 ${SAFE_NAME} — ${TIMESTAMP}"
+
+          # ── Export ─────────────────────────────────────────────────────────
+          {
+            echo "raw_name=$RAW_NAME"
+            echo "safe_name=$SAFE_NAME"
+            echo "remote_size=$REMOTE_SIZE"
+            echo "tag=$TAG"
+            echo "release_name=$RNAME"
+            echo "timestamp=$TIMESTAMP"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '\n%-24s %s\n' "📡 Mode:"        "$SOURCE_TYPE"
+          printf   '%-24s %s\n' "📁 Name:"         "$SAFE_NAME"
+          printf   '%-24s %s\n' "📦 Remote size:"  "$REMOTE_SIZE"
+          printf   '%-24s %s\n' "🏷️  Release tag:" "$TAG"
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §3  ACQUIRE SOURCE — file download (aria2c) or git clone
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 📥 Acquire source
+        id: download
+        run: |
+          echo "::group::Acquiring source"
+          SAFE_NAME="${{ steps.preflight.outputs.safe_name }}"
+          START_TS=$(date +%s)
+          SOURCE_DESC=""
+
+          if [[ "${{ inputs.source_type }}" == "git" ]]; then
+            # ════════════════════════════════════════════════════════════════
+            #  Git clone path
+            # ════════════════════════════════════════════════════════════════
+            REPO_NAME="$SAFE_NAME"
+            CLONE_DIR="$WORK_DIR/$REPO_NAME"
+            DEPTH="${{ inputs.git_clone_depth }}"
+
+            GIT_FLAGS=(--progress)
+            [[ "$DEPTH" != "0" ]] && GIT_FLAGS+=(--depth "$DEPTH")
+
+            # Pass extra HTTP headers to git if provided
+            if [[ -n "${{ inputs.extra_headers }}" ]]; then
+              export GIT_CONFIG_COUNT=1
+              export GIT_CONFIG_KEY_0="http.extraHeader"
+              export GIT_CONFIG_VALUE_0="${{ inputs.extra_headers }}"
+            fi
+
+            echo "→ Cloning: ${{ inputs.url }}"
+            git clone "${GIT_FLAGS[@]}" "${{ inputs.url }}" "$CLONE_DIR"
+
+            # ── Size check against split threshold ──────────────────────────
+            REPO_BYTES=$(du -sb "$CLONE_DIR" | cut -f1)
+            REPO_SIZE_HR=$(numfmt --to=iec "$REPO_BYTES")
+            SPLIT_SIZE="${{ inputs.split_size }}"
+
+            echo "→ Repository size: $REPO_SIZE_HR"
+            if [[ -n "$SPLIT_SIZE" ]]; then
+              SPLIT_BYTES=$(numfmt --from=iec "$SPLIT_SIZE")
+              if (( REPO_BYTES > SPLIT_BYTES )); then
+                echo "::warning::Repository size ($REPO_SIZE_HR) exceeds split threshold ($SPLIT_SIZE) — artifacts will be split into multiple parts"
+              else
+                echo "→ Within split limit ($SPLIT_SIZE) — no split expected"
+              fi
+            fi
+
+            # ── Strip .git directory (optional) ─────────────────────────────
+            if [[ "${{ inputs.git_strip_dotgit }}" == "true" ]]; then
+              rm -rf "$CLONE_DIR/.git"
+              echo "→ Removed .git directory"
+            fi
+
+            # ── Pack into uncompressed tar — §5 will recompress it ──────────
+            #    This lets §5 use its standard tar-detection path for
+            #    consistent handling regardless of source type.
+            OUTPUT="$WORK_DIR/${REPO_NAME}.tar"
+            echo "→ Packing into tar archive..."
+            tar -cf "$OUTPUT" -C "$WORK_DIR" "$REPO_NAME"
+            rm -rf "$CLONE_DIR"
+
+            DEPTH_LABEL="depth $DEPTH"
+            [[ "$DEPTH" == "0" ]] && DEPTH_LABEL="full history"
+            SOURCE_DESC="Git clone ($DEPTH_LABEL)"
+
+          else
+            # ════════════════════════════════════════════════════════════════
+            #  File download path — aria2c
+            # ════════════════════════════════════════════════════════════════
+            OUTPUT="$WORK_DIR/$SAFE_NAME"
+
+            ARIA_ARGS=(
+              "--split=${{ inputs.connections }}"
+              "--max-connection-per-server=${{ inputs.connections }}"
+              "--min-split-size=20M"
+              "--piece-length=4M"
+              "--max-tries=15"
+              "--retry-wait=10"
+              "--connect-timeout=30"
+              "--timeout=600"
+              "--continue=true"
+              "--always-resume=true"
+              "--auto-file-renaming=false"
+              "--file-allocation=none"
+              "--disk-cache=64M"
+              "--no-netrc=true"
+              "--console-log-level=notice"
+              "--summary-interval=30"
+              "--download-result=full"
+              "-d" "$WORK_DIR"
+              "-o" "$SAFE_NAME"
+            )
+            [[ -n "${{ inputs.extra_headers }}" ]] && \
+              ARIA_ARGS+=("--header=${{ inputs.extra_headers }}")
+
+            aria2c "${ARIA_ARGS[@]}" "${{ inputs.url }}"
+            SOURCE_DESC="aria2c (${{ inputs.connections }} connections)"
+          fi
+
+          # ── Common stats ──────────────────────────────────────────────────
+          END_TS=$(date +%s)
+          ELAPSED=$(( END_TS - START_TS ))
+          ELAPSED_FMT=$(printf '%dm %ds' $(( ELAPSED / 60 )) $(( ELAPSED % 60 )))
+          FILE_SIZE=$(stat -c%s "$OUTPUT")
+          ACTUAL_SIZE=$(numfmt --to=iec "$FILE_SIZE")
+
+          if [[ "${{ inputs.source_type }}" == "file" ]]; then
+            AVG_SPEED=$(awk "BEGIN { printf \"%.2f MB/s\", $FILE_SIZE / ($ELAPSED > 0 ? $ELAPSED : 1) / 1048576 }")
+          else
+            AVG_SPEED="N/A"
+          fi
+
+          {
+            echo "output=$OUTPUT"
+            echo "file_size=$FILE_SIZE"
+            echo "actual_size=$ACTUAL_SIZE"
+            echo "elapsed=$ELAPSED"
+            echo "elapsed_fmt=$ELAPSED_FMT"
+            echo "avg_speed=$AVG_SPEED"
+            echo "source_desc=$SOURCE_DESC"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::notice::✅ Source acquired — $ACTUAL_SIZE in $ELAPSED_FMT"
+          printf '%-24s %s\n' "📦 Size:"   "$ACTUAL_SIZE"
+          printf '%-24s %s\n' "⏱️  Time:"  "$ELAPSED_FMT"
+          printf '%-24s %s\n' "🚀 Speed:"  "$AVG_SPEED"
+          printf '%-24s %s\n' "📡 Source:" "$SOURCE_DESC"
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §4  VERIFY — SHA256 against expected value (file mode only)
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🔐 Verify SHA256 against expected value
+        if: inputs.source_type == 'file' && inputs.expected_checksum != ''
+        run: |
+          echo "::group::Checksum verification"
+          OUTPUT="${{ steps.download.outputs.output }}"
+          EXPECTED=$(echo "${{ inputs.expected_checksum }}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+          ACTUAL=$(sha256sum "$OUTPUT" | awk '{print $1}')
+
+          printf '%-12s %s\n' "Expected:" "$EXPECTED"
+          printf '%-12s %s\n' "Actual:"   "$ACTUAL"
+
+          if [[ "$ACTUAL" == "$EXPECTED" ]]; then
+            echo "::notice::✅ Checksum verified — file is intact"
+          else
+            echo "::error::❌ Checksum mismatch — aborting. File may be corrupted or tampered."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §5  COMPRESS — content-based detection via `file --mime-type`
+      #
+      #  Decision tree:
+      #  ┌─ format == 'none'         → skip always
+      #  ├─ application/x-tar        → EXTRACT + REPACK with chosen format
+      #  ├─ known compressed MIME    → skip (already compressed)
+      #  └─ anything else            → compress with chosen format
+      #
+      #  Note: git repos enter this step as .tar (packed in §3), so they
+      #  always hit the EXTRACT + REPACK path for maximum compression.
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🗜️ Compress — content-based detection & tar recompression
+        id: compress
+        run: |
+          echo "::group::Compression"
+          OUTPUT="${{ steps.download.outputs.output }}"
+          FORMAT="${{ inputs.compress_format }}"
+          LEVEL="${{ inputs.compression_level }}"
+          FINAL_FILE="$OUTPUT"
+          DID_COMPRESS=false
+          RATIO="N/A"
+          ACTION="skipped"
+
+          # ── Detect actual MIME type from file content ───────────────────────
+          MIME_TYPE=$(file --mime-type -b "$OUTPUT")
+          FILE_DESC=$(file -b "$OUTPUT")
+          echo "→ MIME type   : $MIME_TYPE"
+          echo "→ Description : $FILE_DESC"
+
+          # ── Route ──────────────────────────────────────────────────────────
+          if [[ "$FORMAT" == "none" ]]; then
+            echo "⏭️  Format set to 'none' — skipping"
+            ACTION="disabled"
+
+          elif [[ "$MIME_TYPE" == "application/x-tar" ]]; then
+            # ── Uncompressed tar: extract and repack with stronger compression ─
+            #    Works for both bare .tar files and git repos packed in §3.
+            echo "📦 Uncompressed tar detected — extracting and repacking with $FORMAT (level $LEVEL)..."
+            ORIG_SIZE=$(stat -c%s "$OUTPUT")
+            BASE_NAME="${OUTPUT%.tar}"
+            EXTRACT_DIR=$(mktemp -d /tmp/extract.XXXXXX)
+
+            tar -xf "$OUTPUT" -C "$EXTRACT_DIR"
+            rm -f "$OUTPUT"
+
+            case "$FORMAT" in
+              zst)
+                tar -cf - -C "$EXTRACT_DIR" . \
+                  | zstd -"$LEVEL" --threads=0 -o "${BASE_NAME}.tar.zst"
+                FINAL_FILE="${BASE_NAME}.tar.zst"
+                ;;
+              tar.gz)
+                tar -czf "${BASE_NAME}.tar.gz" -C "$EXTRACT_DIR" .
+                FINAL_FILE="${BASE_NAME}.tar.gz"
+                ;;
+              zip)
+                (cd "$EXTRACT_DIR" && zip -"$LEVEL" -r "${BASE_NAME}.zip" .)
+                FINAL_FILE="${BASE_NAME}.zip"
+                ;;
+            esac
+
+            rm -rf "$EXTRACT_DIR"
+            DID_COMPRESS=true
+            ACTION="tar → $FORMAT"
+
+          else
+            case "$MIME_TYPE" in
+              # ── Already compressed — skip ──────────────────────────────────
+              application/zip              |\
+              application/gzip             |\
+              application/x-bzip2          |\
+              application/x-xz             |\
+              application/zstd             |\
+              application/x-7z-compressed  |\
+              application/vnd.rar          |\
+              application/x-rar-compressed |\
+              application/x-lzip           |\
+              application/x-lzma           |\
+              application/x-lz4            |\
+              application/x-brotli         )
+                echo "::notice::⏭️ Already compressed ($MIME_TYPE) — skipping"
+                ACTION="already compressed"
+                ;;
+
+              # ── Uncompressed file — compress ───────────────────────────────
+              *)
+                ORIG_SIZE=$(stat -c%s "$OUTPUT")
+                echo "⚙️  Compressing with $FORMAT (level $LEVEL)..."
+
+                case "$FORMAT" in
+                  zst)
+                    zstd -"$LEVEL" --threads=0 --rm "$OUTPUT" -o "${OUTPUT}.zst"
+                    FINAL_FILE="${OUTPUT}.zst"
+                    ;;
+                  tar.gz)
+                    tar -czf "${OUTPUT}.tar.gz" \
+                        -C "$(dirname "$OUTPUT")" "$(basename "$OUTPUT")"
+                    rm -f "$OUTPUT"
+                    FINAL_FILE="${OUTPUT}.tar.gz"
+                    ;;
+                  zip)
+                    zip -"$LEVEL" "${OUTPUT}.zip" -j "$OUTPUT"
+                    rm -f "$OUTPUT"
+                    FINAL_FILE="${OUTPUT}.zip"
+                    ;;
+                esac
+
+                DID_COMPRESS=true
+                ACTION="compressed → $FORMAT"
+                ;;
+            esac
+          fi
+
+          # ── Compute ratio ───────────────────────────────────────────────────
+          if [[ "$DID_COMPRESS" == "true" ]]; then
+            NEW_SIZE=$(stat -c%s "$FINAL_FILE")
+            RATIO=$(awk "BEGIN { printf \"%.1f%%\", (1 - $NEW_SIZE / $ORIG_SIZE) * 100 }")
+            echo "::notice::✅ $ACTION — saved $RATIO ($(numfmt --to=iec $ORIG_SIZE) → $(numfmt --to=iec $NEW_SIZE))"
+          fi
+
+          FINAL_NAME=$(basename "$FINAL_FILE")
+          FINAL_SIZE=$(numfmt --to=iec "$(stat -c%s "$FINAL_FILE")")
+
+          {
+            echo "final_file=$FINAL_FILE"
+            echo "final_name=$FINAL_NAME"
+            echo "final_size=$FINAL_SIZE"
+            echo "compressed=$DID_COMPRESS"
+            echo "ratio=$RATIO"
+            echo "action=$ACTION"
+            echo "mime_type=$MIME_TYPE"
+            echo "file_desc=$FILE_DESC"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%-24s %s\n' "📦 Output:" "$FINAL_NAME ($FINAL_SIZE)"
+          printf '%-24s %s\n' "⚡ Action:" "$ACTION"
+          printf '%-24s %s\n' "📉 Ratio:"  "$RATIO"
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §6  SPLIT — for files exceeding GitHub's 2 GB limit
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: ✂️ Split large files
+        id: split
+        run: |
+          echo "::group::Split check"
+          FINAL_FILE="${{ steps.compress.outputs.final_file }}"
+          FINAL_NAME="${{ steps.compress.outputs.final_name }}"
+          SPLIT_SIZE="${{ inputs.split_size }}"
+          FILE_SIZE=$(stat -c%s "$FINAL_FILE")
+          DID_SPLIT=false
+          PART_COUNT=1
+
+          if [[ -n "$SPLIT_SIZE" ]]; then
+            SPLIT_BYTES=$(numfmt --from=iec "$SPLIT_SIZE")
+            if (( FILE_SIZE > SPLIT_BYTES )); then
+              echo "✂️  $(numfmt --to=iec $FILE_SIZE) exceeds $SPLIT_SIZE — splitting into chunks..."
+              split \
+                --bytes="$SPLIT_SIZE"   \
+                --numeric-suffixes=1    \
+                --suffix-length=3       \
+                "$FINAL_FILE"           \
+                "$PARTS_DIR/${FINAL_NAME}.part"
+              DID_SPLIT=true
+              PART_COUNT=$(find "$PARTS_DIR" -name "*.part*" | wc -l)
+              echo "::notice::✂️ Split complete — $PART_COUNT parts"
+              ls -lh "$PARTS_DIR/"
+            else
+              echo "✅ $(numfmt --to=iec $FILE_SIZE) ≤ $SPLIT_SIZE — no split needed"
+              cp "$FINAL_FILE" "$PARTS_DIR/"
+            fi
+          else
+            echo "⏭️  Splitting disabled"
+            cp "$FINAL_FILE" "$PARTS_DIR/"
+          fi
+
+          {
+            echo "split=$DID_SPLIT"
+            echo "part_count=$PART_COUNT"
+          } >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §7  CHECKSUMS — SHA256 for all artifacts
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🔐 Generate SHA256 checksums
+        run: |
+          echo "::group::Generating checksums"
+          cd "$PARTS_DIR"
+          sha256sum * > SHA256SUMS.txt
+          echo "SHA256SUMS.txt:"
+          cat SHA256SUMS.txt
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §8  RELEASE NOTES — auto-generated markdown
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 📝 Generate release notes
+        run: |
+          FINAL_NAME="${{ steps.compress.outputs.final_name }}"
+          DID_SPLIT="${{ steps.split.outputs.split }}"
+          PART_COUNT="${{ steps.split.outputs.part_count }}"
+          CHECKSUMS=$(cat "$PARTS_DIR/SHA256SUMS.txt")
+
+          cat > release_notes.md << NOTES
+          ## 📦 ${{ steps.preflight.outputs.release_name }}
+
+          ### 🔗 Source
+          | Field | Value |
+          |-------|-------|
+          | Mode | ${{ inputs.source_type }} |
+          | URL | \`${{ inputs.url }}\` |
+          | Original Name | \`${{ steps.preflight.outputs.raw_name }}\` |
+          | Acquired via | ${{ steps.download.outputs.source_desc }} |
+          | Source Size | ${{ steps.download.outputs.actual_size }} |
+          | Remote Size | ${{ steps.preflight.outputs.remote_size }} |
+
+          ### ⚙️ Processing
+          | Step | Result |
+          |------|--------|
+          | MIME Type | \`${{ steps.compress.outputs.mime_type }}\` |
+          | Compression | ${{ steps.compress.outputs.action }} (saved: ${{ steps.compress.outputs.ratio }}) |
+          | Final Size | ${{ steps.compress.outputs.final_size }} |
+          | Split | ${DID_SPLIT} (${PART_COUNT} part(s)) |
+
+          ### 🏗️ Build Info
+          | Field | Value |
+          |-------|-------|
+          | Time elapsed | ${{ steps.download.outputs.elapsed_fmt }} |
+          | Avg. speed | ${{ steps.download.outputs.avg_speed }} |
+          | Date | $(date -u +'%Y-%m-%d %H:%M UTC') |
+          | Triggered by | @${{ github.actor }} |
+          | Workflow Run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ---
+
+          ### 🔐 SHA256 Checksums
+          \`\`\`
+          ${CHECKSUMS}
+          \`\`\`
+
+          ### ✅ Verify Integrity
+          \`\`\`bash
+          sha256sum -c SHA256SUMS.txt
+          \`\`\`
+          NOTES
+
+          # Append reassembly instructions only for split releases
+          if [[ "$DID_SPLIT" == "true" ]]; then
+            cat >> release_notes.md << REASSEMBLE
+
+          ### ♻️ Reassemble Split Parts
+          \`\`\`bash
+          cat ${FINAL_NAME}.part* > ${FINAL_NAME}
+          sha256sum -c SHA256SUMS.txt
+          \`\`\`
+          REASSEMBLE
+          fi
+
+          echo "── release_notes.md ─────────────────────────────────────────────"
+          cat release_notes.md
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §9  JOB SUMMARY — visible in GitHub Actions UI
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 📊 Write job summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## ⬇️ Smart Download & Release
+
+          | Field | Value |
+          |-------|-------|
+          | 📡 Mode | ${{ inputs.source_type }} |
+          | 🔗 Source URL | \`${{ inputs.url }}\` |
+          | 📁 Output File | \`${{ steps.preflight.outputs.safe_name }}\` |
+          | 🔍 MIME Type | \`${{ steps.compress.outputs.mime_type }}\` |
+          | ⚡ Compression | ${{ steps.compress.outputs.action }} (saved ${{ steps.compress.outputs.ratio }}) |
+          | 📦 Final Size | ${{ steps.compress.outputs.final_size }} |
+          | ✂️ Split | ${{ steps.split.outputs.split }} (${{ steps.split.outputs.part_count }} part(s)) |
+          | ⏱️ Time | ${{ steps.download.outputs.elapsed_fmt }} |
+          | 🚀 Speed | ${{ steps.download.outputs.avg_speed }} |
+          | 🏷️ Release Tag | \`${{ steps.preflight.outputs.tag }}\` |
+          | ▶️ Workflow Run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          EOF
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §10  PUBLISH — create GitHub release and upload all artifacts
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🚀 Create GitHub Release and upload artifacts
+        uses: ncipollo/release-action@v1
+        with:
+          tag:                     "${{ steps.preflight.outputs.tag }}"
+          name:                    "${{ steps.preflight.outputs.release_name }}"
+          bodyFile:                "release_notes.md"
+          artifacts:               "/tmp/parts/*"
+          artifactErrorsFailBuild: true
+          draft:                   ${{ inputs.draft }}
+          prerelease:              ${{ inputs.prerelease }}
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §11  CLEANUP — free runner disk space
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🧹 Cleanup temporary files
+        if: always()
+        run: |
+          rm -rf "$WORK_DIR" "$PARTS_DIR"
+          echo "✅ Cleanup done"
