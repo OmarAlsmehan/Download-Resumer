@@ -1,0 +1,456 @@
+name: 🗄️ Git Snapshot & Release
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  What this workflow does:
+#   1. Clone the target repository
+#   2. Wipe everything EXCEPT the .git directory
+#   3. Compress .git into a tight archive
+#   4. Check size against the 2 GB GitHub limit
+#      ├─ Within limit → release directly
+#      └─ Exceeds limit → split into chunks → release
+#   5. Publish a GitHub Release with checksums + notes
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      repo_url:
+        description: "🔗 Repository URL — optionally append branch with -b  (e.g. https://github.com/user/repo.git -b dev)"
+        required: true
+        type: string
+
+      clone_depth:
+        description: "🔢 Clone depth  (0 = full history, 1 = latest commit only)"
+        required: false
+        type: choice
+        options:
+          - "1"
+          - "10"
+          - "50"
+          - "0"
+        default: "0"
+
+      compress_format:
+        description: "🗜️ Archive format"
+        required: false
+        type: choice
+        options:
+          - zst       # best ratio + fastest decompression  ← recommended
+          - tar.gz    # universal
+          - zip       # widest compatibility
+        default: zst
+
+      split_size:
+        description: "✂️ Max chunk size (e.g. 1900M) — leave blank to disable"
+        required: false
+        type: string
+        default: "1900M"
+
+      prerelease:
+        description: "🚧 Publish as pre-release"
+        required: false
+        type: boolean
+        default: false
+
+# ──────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: write
+
+env:
+  WORK_DIR:  /tmp/git-snap
+  PARTS_DIR: /tmp/parts
+
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §1  SETUP
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🔧 Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends zstd git
+          mkdir -p "$WORK_DIR" "$PARTS_DIR"
+          echo "zstd $(zstd --version) | git $(git --version | awk '{print $3}')"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §2  PRE-FLIGHT — derive naming & tags from URL
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🛫 Pre-flight
+        id: preflight
+        run: |
+          RAW_INPUT="${{ inputs.repo_url }}"
+
+          # ── Parse URL and optional -b <branch> from the input ──────────────
+          # Supports:  https://...repo.git
+          #            https://...repo.git -b branchname
+          #            https://...repo.git -b branch/with/slashes
+          REPO_URL=$(echo "$RAW_INPUT" | awk '{print $1}')
+          BRANCH=""
+          if [[ "$RAW_INPUT" =~ [[:space:]]-b[[:space:]]+([^[:space:]]+) ]]; then
+            BRANCH="${BASH_REMATCH[1]}"
+          fi
+
+          # ── Validate URL ────────────────────────────────────────────────────
+          if [[ ! "$REPO_URL" =~ ^https?:// ]]; then
+            echo "::error::URL must start with http:// or https://"
+            exit 1
+          fi
+
+          # ── Derive clean identifiers ────────────────────────────────────────
+          REPO_NAME=$(basename "$REPO_URL" .git)
+          SAFE_NAME=$(echo "$REPO_NAME" | tr ' ' '_' | tr -cd '[:alnum:]._-')
+          [[ -z "$SAFE_NAME" ]] && SAFE_NAME="repo_${{ github.run_number }}"
+
+          # Include branch in archive name to avoid collisions
+          SAFE_BRANCH=""
+          if [[ -n "$BRANCH" ]]; then
+            SAFE_BRANCH=$(echo "$BRANCH" | tr '/' '-' | tr -cd '[:alnum:]._-')
+            ARCHIVE_BASE="${SAFE_NAME}-${SAFE_BRANCH}"
+          else
+            ARCHIVE_BASE="$SAFE_NAME"
+          fi
+
+          TIMESTAMP=$(date +'%Y%m%d-%H%M')
+          TAG="git-snap-${ARCHIVE_BASE}-${TIMESTAMP}"
+          BRANCH_LABEL="${BRANCH:-default branch}"
+          RELEASE_NAME="🗄️ ${SAFE_NAME} (${BRANCH_LABEL}) — git snapshot ${TIMESTAMP}"
+
+          DEPTH_LABEL="full history"
+          [[ "${{ inputs.clone_depth }}" != "0" ]] && \
+            DEPTH_LABEL="depth ${{ inputs.clone_depth }}"
+
+          {
+            echo "repo_url=$REPO_URL"
+            echo "branch=$BRANCH"
+            echo "branch_label=$BRANCH_LABEL"
+            echo "safe_name=$SAFE_NAME"
+            echo "archive_base=$ARCHIVE_BASE"
+            echo "tag=$TAG"
+            echo "release_name=$RELEASE_NAME"
+            echo "timestamp=$TIMESTAMP"
+            echo "depth_label=$DEPTH_LABEL"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%-22s %s\n' "📁 Repo name:"    "$SAFE_NAME"
+          printf '%-22s %s\n' "🌿 Branch:"       "$BRANCH_LABEL"
+          printf '%-22s %s\n' "🏷️  Tag:"         "$TAG"
+          printf '%-22s %s\n' "🔢 Clone depth:"  "$DEPTH_LABEL"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §3  CLONE — full or shallow
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 📥 Clone repository
+        id: clone
+        run: |
+          echo "::group::git clone"
+          SAFE_NAME="${{ steps.preflight.outputs.safe_name }}"
+          REPO_URL="${{ steps.preflight.outputs.repo_url }}"
+          BRANCH="${{ steps.preflight.outputs.branch }}"
+          CLONE_DIR="$WORK_DIR/$SAFE_NAME"
+          DEPTH="${{ inputs.clone_depth }}"
+
+          GIT_FLAGS=(--progress)
+          [[ "$DEPTH" != "0" ]] && GIT_FLAGS+=(--depth "$DEPTH")
+          [[ -n "$BRANCH" ]]    && GIT_FLAGS+=(-b "$BRANCH")
+
+          echo "→ Cloning: $REPO_URL${BRANCH:+ (branch: $BRANCH)}"
+          START=$(date +%s)
+          git clone "${GIT_FLAGS[@]}" "$REPO_URL" "$CLONE_DIR"
+          ELAPSED=$(( $(date +%s) - START ))
+
+          CLONE_BYTES=$(du -sb "$CLONE_DIR" | cut -f1)
+          CLONE_SIZE=$(numfmt --to=iec "$CLONE_BYTES")
+          GIT_BYTES=$(du -sb "$CLONE_DIR/.git" | cut -f1)
+          GIT_SIZE=$(numfmt --to=iec "$GIT_BYTES")
+
+          {
+            echo "clone_dir=$CLONE_DIR"
+            echo "clone_size=$CLONE_SIZE"
+            echo "git_size=$GIT_SIZE"
+            echo "elapsed=$(printf '%dm %ds' $(( ELAPSED / 60 )) $(( ELAPSED % 60 )))"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%-22s %s\n' "📦 Total clone:"  "$CLONE_SIZE"
+          printf '%-22s %s\n' "🗄️  .git only:"   "$GIT_SIZE"
+          printf '%-22s %s\n' "⏱️  Time:"         "$(printf '%dm %ds' $(( ELAPSED / 60 )) $(( ELAPSED % 60 )))"
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §4  STRIP — delete everything except .git
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🗑️ Strip working tree — keep .git only
+        run: |
+          echo "::group::Stripping working tree"
+          CLONE_DIR="${{ steps.clone.outputs.clone_dir }}"
+
+          BEFORE=$(find "$CLONE_DIR" | wc -l)
+
+          # Delete everything that is NOT the .git directory itself
+          find "$CLONE_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' \
+            -exec rm -rf {} +
+
+          AFTER=$(find "$CLONE_DIR" | wc -l)
+          echo "→ Removed $(( BEFORE - AFTER )) paths — only .git remains"
+
+          # Sanity check
+          if [[ ! -d "$CLONE_DIR/.git" ]]; then
+            echo "::error::.git directory is missing after strip — aborting"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §5  COMPRESS — pack .git with the chosen format
+      #
+      #  The .git directory is the entire archive; we pack it directly.
+      #  zst is recommended: it gives the best ratio AND fastest decompression.
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🗜️ Compress .git directory
+        id: compress
+        run: |
+          echo "::group::Compression"
+          SAFE_NAME="${{ steps.preflight.outputs.safe_name }}"
+          ARCHIVE_BASE="${{ steps.preflight.outputs.archive_base }}"
+          CLONE_DIR="${{ steps.clone.outputs.clone_dir }}"
+          FORMAT="${{ inputs.compress_format }}"
+          ORIG_BYTES=$(du -sb "$CLONE_DIR/.git" | cut -f1)
+
+          START=$(date +%s)
+
+          case "$FORMAT" in
+            zst)
+              ARCHIVE="$WORK_DIR/${ARCHIVE_BASE}.git.tar.zst"
+              tar -cf - -C "$CLONE_DIR" .git \
+                | zstd -19 --threads=0 --long=31 -o "$ARCHIVE"
+              ;;
+            tar.gz)
+              ARCHIVE="$WORK_DIR/${ARCHIVE_BASE}.git.tar.gz"
+              tar -czf "$ARCHIVE" -C "$CLONE_DIR" .git
+              ;;
+            zip)
+              ARCHIVE="$WORK_DIR/${ARCHIVE_BASE}.git.zip"
+              (cd "$CLONE_DIR" && zip -9 -r "$ARCHIVE" .git)
+              ;;
+          esac
+
+          ELAPSED=$(( $(date +%s) - START ))
+          NEW_BYTES=$(stat -c%s "$ARCHIVE")
+          RATIO=$(awk "BEGIN { printf \"%.1f%%\", (1 - $NEW_BYTES / $ORIG_BYTES) * 100 }")
+          ARCHIVE_SIZE=$(numfmt --to=iec "$NEW_BYTES")
+
+          {
+            echo "archive=$ARCHIVE"
+            echo "archive_name=$(basename "$ARCHIVE")"
+            echo "archive_bytes=$NEW_BYTES"
+            echo "archive_size=$ARCHIVE_SIZE"
+            echo "ratio=$RATIO"
+            echo "elapsed=$(printf '%dm %ds' $(( ELAPSED / 60 )) $(( ELAPSED % 60 )))"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%-22s %s\n' "📦 Archive:"   "$(basename "$ARCHIVE") ($ARCHIVE_SIZE)"
+          printf '%-22s %s\n' "📉 Saved:"     "$RATIO"
+          printf '%-22s %s\n' "⏱️  Time:"      "$(printf '%dm %ds' $(( ELAPSED / 60 )) $(( ELAPSED % 60 )))"
+          echo "::notice::✅ Compression done — $ARCHIVE_SIZE (saved $RATIO)"
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §6  SIZE CHECK & SPLIT
+      #
+      #  ┌─ Within split limit → copy to parts dir as-is
+      #  └─ Exceeds limit      → split into numbered chunks
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: ✂️ Size check & split if needed
+        id: split
+        run: |
+          echo "::group::Size check & split"
+          ARCHIVE="${{ steps.compress.outputs.archive }}"
+          ARCHIVE_NAME="${{ steps.compress.outputs.archive_name }}"
+          ARCHIVE_BYTES="${{ steps.compress.outputs.archive_bytes }}"
+          SPLIT_SIZE="${{ inputs.split_size }}"
+          DID_SPLIT=false
+          PART_COUNT=1
+
+          if [[ -z "$SPLIT_SIZE" ]]; then
+            echo "⏭️  Splitting disabled — copying as-is"
+            cp "$ARCHIVE" "$PARTS_DIR/"
+          else
+            SPLIT_BYTES=$(numfmt --from=iec "$SPLIT_SIZE")
+            LIMIT_HR=$(numfmt --to=iec "$SPLIT_BYTES")
+            ARCHIVE_HR=$(numfmt --to=iec "$ARCHIVE_BYTES")
+
+            if (( ARCHIVE_BYTES > SPLIT_BYTES )); then
+              echo "⚠️  $ARCHIVE_HR > $LIMIT_HR — splitting..."
+              split \
+                --bytes="$SPLIT_SIZE" \
+                --numeric-suffixes=1  \
+                --suffix-length=3     \
+                "$ARCHIVE"            \
+                "$PARTS_DIR/${ARCHIVE_NAME}.part"
+
+              DID_SPLIT=true
+              PART_COUNT=$(find "$PARTS_DIR" -name "*.part*" | wc -l)
+              echo "::notice::✂️ Split into $PART_COUNT parts"
+              ls -lh "$PARTS_DIR/"
+            else
+              echo "✅ $ARCHIVE_HR ≤ $LIMIT_HR — no split needed"
+              cp "$ARCHIVE" "$PARTS_DIR/"
+            fi
+          fi
+
+          {
+            echo "split=$DID_SPLIT"
+            echo "part_count=$PART_COUNT"
+          } >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §7  CHECKSUMS
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🔐 Generate SHA256 checksums
+        run: |
+          cd "$PARTS_DIR"
+          sha256sum * > SHA256SUMS.txt
+          echo "── SHA256SUMS.txt ──────────────────────────────────────"
+          cat SHA256SUMS.txt
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §8  RELEASE NOTES
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 📝 Generate release notes
+        run: |
+          ARCHIVE_NAME="${{ steps.compress.outputs.archive_name }}"
+          DID_SPLIT="${{ steps.split.outputs.split }}"
+          PART_COUNT="${{ steps.split.outputs.part_count }}"
+          CHECKSUMS=$(cat "$PARTS_DIR/SHA256SUMS.txt")
+
+          cat > release_notes.md << NOTES
+          ## 🗄️ ${{ steps.preflight.outputs.release_name }}
+
+          > This release contains a compressed **bare `.git` snapshot** of the repository.
+          > You can restore a full working copy with \`git clone\` from the archive.
+
+          ### 🔗 Source
+          | Field | Value |
+          |-------|-------|
+          | Repository | \`${{ steps.preflight.outputs.repo_url }}\` |
+          | Branch | \`${{ steps.preflight.outputs.branch_label }}\` |
+          | Clone depth | ${{ steps.preflight.outputs.depth_label }} |
+          | Clone size | ${{ steps.clone.outputs.clone_size }} |
+          | .git size (raw) | ${{ steps.clone.outputs.git_size }} |
+
+          ### ⚙️ Processing
+          | Step | Result |
+          |------|--------|
+          | Format | \`${{ inputs.compress_format }}\` |
+          | Compression level | 19 (maximum) |
+          | Space saved | ${{ steps.compress.outputs.ratio }} |
+          | Final archive | \`${ARCHIVE_NAME}\` (${{ steps.compress.outputs.archive_size }}) |
+          | Split | ${DID_SPLIT} (${PART_COUNT} part(s)) |
+
+          ### 🏗️ Build Info
+          | Field | Value |
+          |-------|-------|
+          | Clone time | ${{ steps.clone.outputs.elapsed }} |
+          | Compress time | ${{ steps.compress.outputs.elapsed }} |
+          | Date | $(date -u +'%Y-%m-%d %H:%M UTC') |
+          | Triggered by | @${{ github.actor }} |
+          | Workflow run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ---
+
+          ### 🔐 SHA256 Checksums
+          \`\`\`
+          ${CHECKSUMS}
+          \`\`\`
+
+          ### ♻️ Restore Working Copy
+          \`\`\`bash
+          # 1. Verify integrity
+          sha256sum -c SHA256SUMS.txt
+
+          # 2. Restore from zst archive
+          mkdir my-repo && cd my-repo
+          git init
+          tar --zstd -xf ../${ARCHIVE_NAME} --strip-components=1
+          git checkout HEAD
+
+          # Or simply re-clone from the bare archive
+          git clone ${ARCHIVE_NAME} my-repo
+          \`\`\`
+          NOTES
+
+          if [[ "$DID_SPLIT" == "true" ]]; then
+            cat >> release_notes.md << REASSEMBLE
+
+          ### 🧩 Reassemble Split Parts First
+          \`\`\`bash
+          cat ${ARCHIVE_NAME}.part* > ${ARCHIVE_NAME}
+          sha256sum -c SHA256SUMS.txt   # verify after reassembly
+          \`\`\`
+          REASSEMBLE
+          fi
+
+          cat release_notes.md
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §9  JOB SUMMARY
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 📊 Write job summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## 🗄️ Git Snapshot & Release
+
+          | Field | Value |
+          |-------|-------|
+          | 🔗 Repository | \`${{ steps.preflight.outputs.repo_url }}\` |
+          | 🌿 Branch | ${{ steps.preflight.outputs.branch_label }} |
+          | 🔢 Clone depth | ${{ steps.preflight.outputs.depth_label }} |
+          | 📦 Clone size | ${{ steps.clone.outputs.clone_size }} |
+          | 🗄️ .git raw size | ${{ steps.clone.outputs.git_size }} |
+          | 🗜️ Format | \`${{ inputs.compress_format }}\` |
+          | 📉 Space saved | ${{ steps.compress.outputs.ratio }} |
+          | 📦 Archive size | ${{ steps.compress.outputs.archive_size }} |
+          | ✂️ Split | ${{ steps.split.outputs.split }} (${{ steps.split.outputs.part_count }} part(s)) |
+          | 🏷️ Tag | \`${{ steps.preflight.outputs.tag }}\` |
+          | ▶️ Run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          EOF
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §10  PUBLISH RELEASE
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🚀 Publish GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag:                     "${{ steps.preflight.outputs.tag }}"
+          name:                    "${{ steps.preflight.outputs.release_name }}"
+          bodyFile:                "release_notes.md"
+          artifacts:               "/tmp/parts/*"
+          artifactErrorsFailBuild: true
+          prerelease:              ${{ inputs.prerelease }}
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  §11  CLEANUP
+      # ════════════════════════════════════════════════════════════════════════
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: rm -rf "$WORK_DIR" "$PARTS_DIR"
+
