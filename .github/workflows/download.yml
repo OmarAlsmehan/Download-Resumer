@@ -1,0 +1,160 @@
+name: Download & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Direct HTTP(S) URL
+        required: true
+        type: string
+      filename:
+        description: Optional output filename override
+        required: false
+        type: string
+      expected_sha256:
+        description: Optional SHA256 of the original downloaded file
+        required: false
+        type: string
+      connections:
+        description: Parallel connections per server
+        required: false
+        type: choice
+        options: ["16", "8", "4", "1"]
+        default: "16"
+      compression:
+        description: Compression mode
+        required: false
+        type: choice
+        options: [auto, none, zstd, gzip, zip]
+        default: auto
+      split_size:
+        description: Maximum release asset size (e.g. 1900M)
+        required: false
+        type: string
+        default: 1900M
+      prerelease:
+        description: Publish as prerelease
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: download-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      WORKDIR: ${{ runner.temp }}/download-resumer
+      OUTPUTDIR: ${{ runner.temp }}/download-resumer/release
+      AUTH_HEADER: ${{ secrets.DOWNLOAD_AUTH_HEADER }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends aria2 zstd zip file
+
+      - name: Prepare
+        env:
+          URL: ${{ inputs.url }}
+          FILENAME_INPUT: ${{ inputs.filename }}
+          CONNECTIONS: ${{ inputs.connections }}
+        run: |
+          set -Eeuo pipefail
+          source scripts/lib.sh
+          rm -rf "$WORKDIR"
+          mkdir -p "$WORKDIR" "$OUTPUTDIR"
+          if [[ -n "$AUTH_HEADER" ]]; then
+            echo "::add-mask::$AUTH_HEADER"
+            printf '%s' "$AUTH_HEADER" | sed -E 's/^([^:]+):.*/\1: [REDACTED]/'
+          fi
+          [[ "$URL" =~ ^https?:// ]] || die 'URL must use http:// or https://'
+          RAW_NAME="$(detect_filename "$URL" "$FILENAME_INPUT")"
+          SAFE_NAME="$(sanitize_name "$RAW_NAME")"
+          echo "safe_name=$SAFE_NAME" >> "$GITHUB_ENV"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download
+        env:
+          URL: ${{ inputs.url }}
+          CONNECTIONS: ${{ inputs.connections }}
+        run: |
+          set -Eeuo pipefail
+          cd "$WORKDIR"
+          args=(
+            --continue=true --always-resume=true
+            --max-connection-per-server="$CONNECTIONS"
+            --split="${CONNECTIONS}"
+            --min-split-size=20M
+            --file-allocation=none
+            --auto-file-renaming=false
+            --allow-overwrite=true
+            --summary-interval=30
+            --check-integrity=true
+            --timeout=30 --connect-timeout=15 --max-tries=10 --retry-wait=5
+            --out="$safe_name"
+          )
+          if [[ -n "$AUTH_HEADER" ]]; then args+=(--header="$AUTH_HEADER"); fi
+          aria2c "${args[@]}" "$URL"
+
+      - name: Verify and package
+        env:
+          EXPECTED: ${{ inputs.expected_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          source scripts/lib.sh
+          file="$WORKDIR/$safe_name"
+          [[ -f "$file" ]] || die "Download missing: $file"
+          actual="$(sha256 "$file")"
+          if [[ -n "$EXPECTED" ]]; then
+            [[ "$EXPECTED" =~ ^[0-9a-fA-F]{64}$ ]] || die 'expected_sha256 must be 64 hexadecimal characters'
+            [[ "${actual,,}" == "${EXPECTED,,}" ]] || die "SHA256 mismatch: got $actual, expected $EXPECTED"
+          fi
+          scripts/process-file.sh \
+            --input "$file" \
+            --workdir "$WORKDIR" \
+            --outputdir "$OUTPUTDIR" \
+            --compression '${{ inputs.compression }}' \
+            --split-size '${{ inputs.split_size }}'
+
+      - name: Create release
+        env:
+          PRERELEASE: ${{ inputs.prerelease }}
+          URL: ${{ inputs.url }}
+        run: |
+          set -Eeuo pipefail
+          source scripts/lib.sh
+          timestamp="$(date -u +'%Y%m%d-%H%M%S')"
+          tag="download-${safe_name}-${timestamp}-${GITHUB_RUN_NUMBER}"
+          title="Download: ${safe_name}"
+          safe_url="$(safe_url_for_notes "$URL")"
+          cat > "$WORKDIR/notes.md" <<EOF2
+          ## Download Resumer
+
+          **Source:** \
+          \`$safe_url\`
+
+          **Original SHA256:** \`$(awk '{print $1}' "$OUTPUTDIR/SOURCE-SHA256.txt")\`
+
+          **Assets:**
+          EOF2
+          for f in "$OUTPUTDIR"/*; do
+            printf '%s\n' "- \\`$(basename "$f")\\`" >> "$WORKDIR/notes.md"
+          done
+          assets=()
+          for f in "$OUTPUTDIR"/*; do assets+=("$f"); done
+          gh release create "$tag" "${assets[@]}" \
+            --title "$title" \
+            --notes-file "$WORKDIR/notes.md" \
+            --target "$GITHUB_SHA" \
+            $([[ "$PRERELEASE" == true ]] && printf '%s' '--prerelease')

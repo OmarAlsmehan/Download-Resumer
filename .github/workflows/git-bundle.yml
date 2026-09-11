@@ -1,0 +1,102 @@
+name: Git Bundle & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: Git repository HTTPS URL
+        required: true
+        type: string
+      branch:
+        description: Optional branch to bundle; blank means all refs
+        required: false
+        type: string
+      compression:
+        description: Bundle compression
+        required: false
+        type: choice
+        options: [zstd, gzip, none]
+        default: zstd
+      split_size:
+        description: Maximum release asset size (e.g. 1900M)
+        required: false
+        type: string
+        default: 1900M
+      prerelease:
+        description: Publish as prerelease
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: git-bundle-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      WORKDIR: ${{ runner.temp }}/git-bundle
+      OUTPUTDIR: ${{ runner.temp }}/git-bundle/release
+      GH_TOKEN: ${{ github.token }}
+      GIT_AUTH_HEADER: ${{ secrets.GIT_AUTH_HEADER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends zstd
+      - name: Build bundle
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          BRANCH: ${{ inputs.branch }}
+          COMPRESSION: ${{ inputs.compression }}
+          GIT_AUTH_HEADER: ${{ secrets.GIT_AUTH_HEADER }}
+          SPLIT_SIZE: ${{ inputs.split_size }}
+        run: |
+          set -Eeuo pipefail
+          source scripts/lib.sh
+          rm -rf "$WORKDIR"
+          mkdir -p "$WORKDIR" "$OUTPUTDIR"
+          args=(--repo "$REPO_URL" --workdir "$WORKDIR" --outputdir "$OUTPUTDIR" --compression "$COMPRESSION" --split-size "$SPLIT_SIZE")
+          if [[ -n "$BRANCH" ]]; then args+=(--branch "$BRANCH"); fi
+          if [[ -n "$GIT_AUTH_HEADER" ]]; then
+            echo "::add-mask::$GIT_AUTH_HEADER"
+            args+=(--http-header "$GIT_AUTH_HEADER")
+          fi
+          scripts/make-git-bundle.sh "${args[@]}"
+      - name: Publish release
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          BRANCH: ${{ inputs.branch }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -Eeuo pipefail
+          source scripts/lib.sh
+          base="$(basename "${REPO_URL%%\?*}" .git)"
+          base="$(sanitize_name "$base")"
+          timestamp="$(date -u +'%Y%m%d-%H%M%S')"
+          tag="git-bundle-${base}-${timestamp}-${GITHUB_RUN_NUMBER}"
+          scope="all refs"
+          [[ -n "$BRANCH" ]] && scope="branch: $BRANCH"
+          safe_url="$(safe_url_for_notes "$REPO_URL")"
+          cat > "$WORKDIR/notes.md" <<EOF2
+          ## Git Bundle
+
+          **Repository:** \`$safe_url\`
+          **Scope:** \`$scope\`
+
+          Restore instructions are included in \`GIT-BUNDLE-INFO.txt\`.
+          EOF2
+          assets=()
+          for f in "$OUTPUTDIR"/*; do assets+=("$f"); done
+          gh release create "$tag" "${assets[@]}" \
+            --title "Git bundle: $base" \
+            --notes-file "$WORKDIR/notes.md" \
+            --target "$GITHUB_SHA" \
+            $([[ "$PRERELEASE" == true ]] && printf '%s' '--prerelease')
