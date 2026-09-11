@@ -1,4 +1,4 @@
-name: Download & Release
+name: HTTP Download
 
 on:
   workflow_dispatch:

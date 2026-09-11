@@ -1,4 +1,4 @@
-name: Test
+name: CI Tests
 
 on:
   push:
@@ -17,4 +17,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends zstd zip aria2
       - name: Run tests
-        run: bash tests/test.sh
+        run: |
+          bash tests/test.sh
+          bash tests/torrent-test.sh

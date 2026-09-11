@@ -1,4 +1,4 @@
-name: Git Bundle & Release
+name: Git Bundle
 
 on:
   workflow_dispatch:

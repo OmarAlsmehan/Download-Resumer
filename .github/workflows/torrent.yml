@@ -1,0 +1,138 @@
+name: Torrent Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Magnet URI, uTorrent Lite share URL, or HTTPS .torrent URL
+        required: true
+        type: string
+      connections:
+        description: Maximum BitTorrent peers
+        required: false
+        type: choice
+        options: ["100", "50", "32", "16", "8"]
+        default: "50"
+      seed_time:
+        description: Seed time after completion (minutes, 0 disables seeding)
+        required: false
+        type: string
+        default: "0"
+      expected_sha256:
+        description: Optional SHA256 for single-file torrent payloads
+        required: false
+        type: string
+      compression:
+        description: Compression mode
+        required: false
+        type: choice
+        options: [auto, none, zstd, gzip, zip]
+        default: auto
+      split_size:
+        description: Maximum release asset size (e.g. 1900M)
+        required: false
+        type: string
+        default: 1900M
+      prerelease:
+        description: Publish as prerelease
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: torrent-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  torrent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      WORKDIR: ${{ runner.temp }}/download-resumer-torrent
+      OUTPUTDIR: ${{ runner.temp }}/download-resumer-torrent/release
+      GH_TOKEN: ${{ github.token }}
+      TORRENT_AUTH_HEADER: ${{ secrets.TORRENT_AUTH_HEADER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends aria2 curl zstd zip tar file python3
+
+      - name: Download torrent
+        env:
+          SOURCE: ${{ inputs.source }}
+          CONNECTIONS: ${{ inputs.connections }}
+          SEED_TIME: ${{ inputs.seed_time }}
+          EXPECTED: ${{ inputs.expected_sha256 }}
+          COMPRESSION: ${{ inputs.compression }}
+          SPLIT_SIZE: ${{ inputs.split_size }}
+        run: |
+          set -Eeuo pipefail
+          source scripts/lib.sh
+          rm -rf "$WORKDIR"
+          mkdir -p "$WORKDIR" "$OUTPUTDIR"
+          case "$SOURCE" in
+            magnet:*|https://lite.utorrent.com/player?*|https://lite.utorrent.com/player/?*|http://*|https://*) ;;
+            *) die 'source must be a Magnet URI, uTorrent Lite share URL, or HTTP(S) metainfo URL' ;;
+          esac
+          args=(
+            --source "$SOURCE"
+            --workdir "$WORKDIR"
+            --outputdir "$OUTPUTDIR"
+            --connections "$CONNECTIONS"
+            --seed-time "$SEED_TIME"
+            --compression "$COMPRESSION"
+            --split-size "$SPLIT_SIZE"
+          )
+          if [[ -n "$EXPECTED" ]]; then args+=(--expected-sha256 "$EXPECTED"); fi
+          if [[ -n "$TORRENT_AUTH_HEADER" ]]; then
+            echo "::add-mask::$TORRENT_AUTH_HEADER"
+            args+=(--auth-header "$TORRENT_AUTH_HEADER")
+          fi
+          scripts/torrent.sh "${args[@]}"
+
+      - name: Publish release
+        env:
+          SOURCE: ${{ inputs.source }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -Eeuo pipefail
+          source scripts/lib.sh
+          source_name="torrent"
+          if [[ "$SOURCE" =~ ^https?:// ]]; then
+            source_name="$(basename "${SOURCE%%\?*}" .torrent)"
+          fi
+          source_name="$(sanitize_name "$source_name")"
+          timestamp="$(date -u +'%Y%m%d-%H%M%S')"
+          tag="torrent-${source_name}-${timestamp}-${GITHUB_RUN_NUMBER}"
+          safe_source="$(safe_url_for_notes "$SOURCE")"
+          cat > "$WORKDIR/notes.md" <<EOF2
+          ## Torrent Download
+
+          **Source:** \`$safe_source\`
+
+          **Max peers:** \`${{ inputs.connections }}\`
+          **Seed time:** \`${{ inputs.seed_time }} minutes\`
+
+          Torrent metadata and restore instructions are included in the release assets.
+          EOF2
+          shopt -s nullglob
+          assets=("$OUTPUTDIR"/*)
+          ((${#assets[@]} > 0)) || die 'No release assets were produced'
+          release_args=(
+            "$tag"
+            "${assets[@]}"
+            --title "Torrent: $source_name"
+            --notes-file "$WORKDIR/notes.md"
+            --target "$GITHUB_SHA"
+          )
+          if [[ "$PRERELEASE" == true ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "${release_args[@]}"
