@@ -51,13 +51,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      WORKDIR: ${{ runner.temp }}/download-resumer-torrent
-      OUTPUTDIR: ${{ runner.temp }}/download-resumer-torrent/release
       GH_TOKEN: ${{ github.token }}
       TORRENT_AUTH_HEADER: ${{ secrets.TORRENT_AUTH_HEADER }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set paths
+        run: |
+          echo "WORKDIR=${RUNNER_TEMP}/download-resumer-torrent" >> "$GITHUB_ENV"
+          echo "OUTPUTDIR=${RUNNER_TEMP}/download-resumer-torrent/release" >> "$GITHUB_ENV"
 
       - name: Install tools
         run: |

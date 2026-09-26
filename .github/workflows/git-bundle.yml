@@ -40,13 +40,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      WORKDIR: ${{ runner.temp }}/git-bundle
-      OUTPUTDIR: ${{ runner.temp }}/git-bundle/release
       GH_TOKEN: ${{ github.token }}
       GIT_AUTH_HEADER: ${{ secrets.GIT_AUTH_HEADER }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Set paths
+        run: |
+          echo "WORKDIR=${RUNNER_TEMP}/git-bundle" >> "$GITHUB_ENV"
+          echo "OUTPUTDIR=${RUNNER_TEMP}/git-bundle/release" >> "$GITHUB_ENV"
       - name: Install tools
         run: |
           sudo apt-get update -qq

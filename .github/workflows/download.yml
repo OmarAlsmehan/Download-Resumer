@@ -50,13 +50,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      WORKDIR: ${{ runner.temp }}/download-resumer
-      OUTPUTDIR: ${{ runner.temp }}/download-resumer/release
       AUTH_HEADER: ${{ secrets.DOWNLOAD_AUTH_HEADER }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set paths
+        run: |
+          echo "WORKDIR=${RUNNER_TEMP}/download-resumer" >> "$GITHUB_ENV"
+          echo "OUTPUTDIR=${RUNNER_TEMP}/download-resumer/release" >> "$GITHUB_ENV"
 
       - name: Install tools
         run: |
@@ -149,7 +152,7 @@ jobs:
           **Assets:**
           EOF2
           for f in "$OUTPUTDIR"/*; do
-            printf '%s\n' "- \\`$(basename "$f")\\`" >> "$WORKDIR/notes.md"
+            printf '%s\n' "- \`$(basename "$f")\`" >> "$WORKDIR/notes.md"
           done
           assets=()
           for f in "$OUTPUTDIR"/*; do assets+=("$f"); done
